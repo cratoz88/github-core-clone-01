@@ -1357,7 +1357,8 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
 // ------------------------------------------------------------------ GraphQL v4
 
 interface GqlValue { kind: 'variable' | 'int' | 'float' | 'string' | 'boolean' | 'null' | 'enum' | 'list' | 'object'; name?: string; value?: unknown; values?: GqlValue[]; fields?: { name: string; value: GqlValue }[] }
-interface GqlField { alias: string | null; name: string; args: Record<string, GqlValue>; selections: GqlField[] | null }
+interface GqlField { alias: string | null; name: string; args: Record<string, GqlValue>; selections: GqlField[] | null; fragment?: string | null }
+const GQL_SKIP: unique symbol = Symbol('skip');
 interface GqlOperation { type: 'query' | 'mutation'; name: string | null; variables: Record<string, GqlValue | undefined>; selections: GqlField[] }
 
 function gqlTokenize(src: string): string[] {
@@ -1461,7 +1462,7 @@ class GqlParser {
           const typeName = this.next();
           this.skipDirectives();
           const inner = this.parseSelections();
-          for (const f of inner) out.push({ ...f, name: `...on:${typeName}:${f.name}` });
+          for (const f of inner) out.push({ ...f, fragment: typeName });
         } else {
           this.next(); // named fragment spread: skip (fragments defined inline are rare here)
         }
@@ -1559,12 +1560,8 @@ function gqlResolveField(ctx: GqlCtx, parent: GqlObj, field: GqlField, variables
   const name = field.name;
   if (name === '__typename') return parent.__type;
   const type = parent.__type;
-  // Inline fragment marker: field name was rewritten as ...on:Type:field
-  if (name.startsWith('...on:')) {
-    const [, fragType, realName] = name.split(':');
-    if (fragType !== type) return null;
-    return gqlResolveField(ctx, parent, { ...field, name: realName }, variables);
-  }
+  // A field under an inline fragment that does not match this type is omitted.
+  if (field.fragment && field.fragment !== type) return GQL_SKIP;
   const unknown = (): null => { ctx.errors.push({ message: `Cannot query field "${name}" on type "${type}"` }); return null; };
 
   if (type === 'Query') {
@@ -1654,7 +1651,7 @@ function gqlResolveField(ctx: GqlCtx, parent: GqlObj, field: GqlField, variables
       const id = nextGlobalId; nextGlobalId += 1;
       const comment: Comment = { id, nodeId: gid('Comment', `${repo.id}:${issue.number}:${id}`), body: String(input.body ?? ''), user: repo.owner, seq: nextSeq() };
       issue.comments.push(comment);
-      return { commentEdge: { node: { __type: 'Comment', comment } } };
+      return { commentEdge: { __type: 'CommentEdge', node: { __type: 'Comment', comment } } };
     }
     return unknown();
   }
@@ -1770,6 +1767,10 @@ function gqlResolveField(ctx: GqlCtx, parent: GqlObj, field: GqlField, variables
     if (name === 'cursor') return null;
     return unknown();
   }
+  if (type === 'CommentEdge') {
+    if (name === 'node') return (parent as unknown as { node: unknown }).node;
+    return unknown();
+  }
   if (type === 'ChangedFile') {
     if (name === 'path') return (parent as unknown as { path: string }).path;
     return unknown();
@@ -1810,11 +1811,30 @@ function gqlResolveField(ctx: GqlCtx, parent: GqlObj, field: GqlField, variables
   }
   return unknown();
 }
+function gqlExecutePlainValue(ctx: GqlCtx, value: Record<string, unknown>, selections: GqlField[], variables: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of selections) {
+    const key = field.alias ?? field.name;
+    const subVal = value[field.name];
+    if (subVal === null || subVal === undefined) { out[key] = null; continue; }
+    if (typeof subVal === 'object' && '__type' in (subVal as Record<string, unknown>)) {
+      out[key] = field.selections ? gqlExecuteSelections(ctx, subVal as GqlObj, field.selections, variables) : subVal;
+    } else if (typeof subVal === 'object' && field.selections && !Array.isArray(subVal)) {
+      out[key] = gqlExecutePlainValue(ctx, subVal as Record<string, unknown>, field.selections, variables);
+    } else if (Array.isArray(subVal)) {
+      out[key] = subVal.map((v) => (v && typeof v === 'object' && '__type' in (v as Record<string, unknown>) && field.selections ? gqlExecuteSelections(ctx, v as GqlObj, field.selections, variables) : v));
+    } else {
+      out[key] = subVal;
+    }
+  }
+  return out;
+}
 function gqlExecuteSelections(ctx: GqlCtx, parent: GqlObj, selections: GqlField[], variables: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const field of selections) {
     const key = field.alias ?? field.name;
     const value = gqlResolveField(ctx, parent, field, variables);
+    if (value === GQL_SKIP) continue;
     if (value === null || value === undefined) { out[key] = value ?? null; continue; }
     if (typeof value === 'object' && '__type' in (value as Record<string, unknown>)) {
       if (field.selections) out[key] = gqlExecuteSelections(ctx, value as GqlObj, field.selections, variables);
@@ -1826,18 +1846,7 @@ function gqlExecuteSelections(ctx: GqlCtx, parent: GqlObj, selections: GqlField[
       });
     } else if (typeof value === 'object' && field.selections) {
       // Plain object (mutation payload): walk its keys with sub-selections.
-      const sub: Record<string, unknown> = {};
-      for (const subField of field.selections) {
-        const subVal = (value as Record<string, unknown>)[subField.name];
-        if (subVal && typeof subVal === 'object' && '__type' in (subVal as Record<string, unknown>)) {
-          sub[subField.alias ?? subField.name] = subField.selections ? gqlExecuteSelections(ctx, subVal as GqlObj, subField.selections, variables) : subVal;
-        } else if (subVal && typeof subVal === 'object' && subField.selections) {
-          sub[subField.alias ?? subField.name] = gqlExecuteSelections(ctx, { __type: 'Plain', ...(subVal as Record<string, unknown>) } as unknown as GqlObj, subField.selections, variables);
-        } else {
-          sub[subField.alias ?? subField.name] = subVal ?? null;
-        }
-      }
-      out[key] = sub;
+      out[key] = gqlExecutePlainValue(ctx, value as Record<string, unknown>, field.selections, variables);
     } else {
       out[key] = value;
     }
